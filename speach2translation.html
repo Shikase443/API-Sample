@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <!-- スマホ向けViewport設定 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>リアルタイム多言語翻訳 (Whisper & GPT‑3.5‑turbo)</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- OpenAI APIキー入力（伏字） -->
+  <div>
+    <label>OpenAI APIキー:
+      <input type="password" id="openaiApiKey" placeholder="APIキーを入力">
+    </label>
+  </div>
+  <div>
+    <label>RMS閾値設定:
+      <input type="range" id="threshold" min="0" max="0.1" step="0.01" value="0.05" />
+      <span id="thresholdValue">0.05</span>
+    </label>
+    <div class="rms-container">
+      <div>RMS: <span id="rmsValue">0.000</span></div>
+      <div class="rms-bar" id="rmsBar"></div>
+      <div class="rms-threshold-line" id="thresholdLine"></div>
+    </div>
+    <label>無音判定(sec): 
+      <input type="number" id="silenceSeconds" value="1" min="0.1" max="2" step="0.1" />
+    </label>
+    <label>音声分割(sec): 
+      <input type="number" id="maxSegmentSeconds" value="5" min="1" max="10" step="1" />
+    </label>
+    <br><br>
+  </div>
+
+  <button id="start">録音開始</button>
+  <button id="stop">録音停止</button>
+
+  <h4>Japanese (認識結果)</h4>
+  <div id="result"></div>
+
+  <div>
+    <label for="langSelect1">翻訳結果 1:</label>
+    <select id="langSelect1">
+      <option value="en" selected>English</option>
+      <option value="fr">French</option>
+      <option value="zh">Chinese</option>
+      <option value="ko">Korean</option>
+      <option value="de">German</option>
+      <option value="id">Indonesian</option>
+      <option value="hi">Hindi</option>
+    </select>
+  </div>
+  <h4>Translation 1</h4>
+  <div id="translation1"></div>
+
+  <div>
+    <label for="langSelect2">翻訳結果 2:</label>
+    <select id="langSelect2">
+      <option value="en">English</option>
+      <option value="fr">French</option>
+      <option value="zh" selected>Chinese</option>
+      <option value="ko">Korean</option>
+      <option value="de">German</option>
+      <option value="id">Indonesian</option>
+      <option value="hi">Hindi</option>
+    </select>
+  </div>
+  <h4>Translation 2</h4>
+  <div id="translation2"></div>
+
+  <script>
+    let stream, audioCtx, analyser, currentRecorder;
+    let recording = false;
+    let silenceThreshold = 0.05;
+    let silenceDuration = 1000; // ms
+    let maxSegmentDuration = 5000;
+    let thresholdExceedDuration = 200;
+    let thresholdExceedStart = null;
+    let silenceStart = null, segmentTimer;
+    let segmentThresholdExceeded = false;
+
+    // 認識結果（最大3回分）と各翻訳結果の保持
+    const resultLines = [];
+    const translationLines1 = [];
+    const translationLines2 = [];
+    let latestText = "";
+
+    const resultDiv = document.getElementById('result');
+    const translationDiv1 = document.getElementById('translation1');
+    const translationDiv2 = document.getElementById('translation2');
+    const rmsValueEl = document.getElementById('rmsValue');
+    const rmsBarEl = document.getElementById('rmsBar');
+    const thresholdLineEl = document.getElementById('thresholdLine');
+
+    function initSettings() {
+      const thresholdEl = document.getElementById('threshold');
+      const thresholdValEl = document.getElementById('thresholdValue');
+      thresholdEl.addEventListener('input', () => {
+        silenceThreshold = parseFloat(thresholdEl.value);
+        thresholdValEl.textContent = thresholdEl.value;
+        updateThresholdLine();
+      });
+      document.getElementById('silenceSeconds').addEventListener('change', e => {
+        silenceDuration = parseFloat(e.target.value) * 1000;
+      });
+      document.getElementById('maxSegmentSeconds').addEventListener('change', e => {
+        maxSegmentDuration = parseFloat(e.target.value) * 1000;
+      });
+      document.getElementById('langSelect1').addEventListener('change', updateAllTranslation1);
+      document.getElementById('langSelect2').addEventListener('change', updateAllTranslation2);
+      updateThresholdLine();
+    }
+
+    function updateThresholdLine() {
+      const ratio = Math.min(1, silenceThreshold / 0.1);
+      thresholdLineEl.style.left = (ratio * 100) + '%';
+    }
+
+    async function startRecording() {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+      recording = true;
+      startSegment();
+      monitorSilence();
+    }
+
+    function startSegment() {
+      currentRecorder = new MediaRecorder(stream);
+      segmentThresholdExceeded = false;
+      let audioChunks = [];
+      currentRecorder.ondataavailable = e => {
+        audioChunks.push(e.data);
+      };
+      currentRecorder.onstop = () => {
+        if (!segmentThresholdExceeded) {
+          if (recording) startSegment();
+          return;
+        }
+        const blob = new Blob(audioChunks, { type: 'audio/wav' });
+        sendToWhisperAPI(blob);
+        if (recording) startSegment();
+      };
+      currentRecorder.start();
+      segmentTimer = setTimeout(() => {
+        if (currentRecorder.state === 'recording') {
+          currentRecorder.stop();
+          clearTimeout(segmentTimer);
+        }
+      }, maxSegmentDuration);
+    }
+
+    function monitorSilence() {
+      const data = new Uint8Array(analyser.fftSize);
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {
+        const val = (data[i] - 128) / 128;
+        sum += val * val;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      rmsValueEl.textContent = rms.toFixed(3);
+      const barWidth = Math.min(100, (rms / 0.1) * 100);
+      rmsBarEl.style.width = barWidth + '%';
+      rmsBarEl.style.background = (rms < silenceThreshold) ? 'red' : 'green';
+      if (rms >= silenceThreshold) {
+        if (thresholdExceedStart === null) {
+          thresholdExceedStart = Date.now();
+        }
+        if (Date.now() - thresholdExceedStart >= thresholdExceedDuration) {
+          segmentThresholdExceeded = true;
+        }
+      } else {
+        thresholdExceedStart = null;
+      }
+      if (rms < silenceThreshold) {
+        if (!silenceStart) {
+          silenceStart = Date.now();
+        } else if (Date.now() - silenceStart > silenceDuration) {
+          if (currentRecorder && currentRecorder.state === 'recording') {
+            currentRecorder.stop();
+            clearTimeout(segmentTimer);
+          }
+          silenceStart = null;
+        }
+      } else {
+        silenceStart = null;
+      }
+      if (recording) requestAnimationFrame(monitorSilence);
+    }
+
+    function stopRecording() {
+      recording = false;
+      if (currentRecorder && currentRecorder.state === 'recording') {
+        currentRecorder.stop();
+      }
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+      if (audioCtx) {
+        audioCtx.close();
+      }
+    }
+
+    // GPT‑3.5‑turboを利用して翻訳を行う関数
+    async function callGPTAPI(text, lang) {
+      const langNames = {
+        en: "English",
+        fr: "French",
+        zh: "Chinese",
+        ko: "Korean",
+        de: "German",
+        id: "Indonesian",
+        hi: "Hindi"
+      };
+      const targetLang = langNames[lang] || "English";
+      const prompt = "次の日本語を流暢で自然な" + targetLang + "に翻訳してください。翻訳した結果のみを回答してください。\n" + text;
+      const apiKey = document.getElementById("openaiApiKey").value;
+      if (!apiKey) {
+        alert("OpenAI APIキーを入力してください");
+        return "APIキー未設定";
+      }
+      try {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + apiKey
+          },
+          body: JSON.stringify({
+            model: "gpt-3.5-turbo",
+            messages: [
+              { role: "system", content: "You are a translation assistant." },
+              { role: "user", content: prompt }
+            ],
+            temperature: 0.3,
+            max_tokens: 1000
+          })
+        });
+        if (!response.ok) throw new Error("GPT APIエラー: " + response.status);
+        const data = await response.json();
+        const translatedText = data.choices[0].message.content.trim();
+        return translatedText;
+      } catch (error) {
+        console.error("GPT APIエラー:", error);
+        return "Translation failed.";
+      }
+    }
+
+    async function updateAllTranslation1() {
+      if (resultLines.length === 0) return;
+      const lang1 = document.getElementById('langSelect1').value;
+      const newTranslations = [];
+      for (const text of resultLines) {
+        const translation = await callGPTAPI(text, lang1);
+        newTranslations.push(translation);
+      }
+      translationLines1.length = 0;
+      translationLines1.push(...newTranslations);
+      translationDiv1.innerHTML = translationLines1.join('<br>');
+      translationDiv1.scrollTop = translationDiv1.scrollHeight;
+    }
+
+    async function updateAllTranslation2() {
+      if (resultLines.length === 0) return;
+      const lang2 = document.getElementById('langSelect2').value;
+      const newTranslations = [];
+      for (const text of resultLines) {
+        const translation = await callGPTAPI(text, lang2);
+        newTranslations.push(translation);
+      }
+      translationLines2.length = 0;
+      translationLines2.push(...newTranslations);
+      translationDiv2.innerHTML = translationLines2.join('<br>');
+      translationDiv2.scrollTop = translationDiv2.scrollHeight;
+    }
+
+    // Whisper API (OpenAI) を呼び出して文字起こしを行う関数
+    async function sendToWhisperAPI(blob) {
+      const apiKey = document.getElementById("openaiApiKey").value;
+      if (!apiKey) {
+        alert("OpenAI APIキーを入力してください");
+        return;
+      }
+      const formData = new FormData();
+      formData.append('file', blob, 'audio.wav');
+      formData.append('model', 'whisper-1');
+      try {
+        const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+          method: "POST",
+          headers: { "Authorization": "Bearer " + apiKey },
+          body: formData
+        });
+        if (!response.ok) throw new Error("Whisper APIエラー: " + response.status);
+        const data = await response.json();
+        if (data.text) {
+          latestText = data.text;
+          resultLines.push(data.text);
+          if (resultLines.length > 3) resultLines.shift();
+          resultDiv.innerHTML = resultLines.join('<br>');
+          await updateAllTranslation1();
+          await updateAllTranslation2();
+          resultDiv.scrollTop = resultDiv.scrollHeight;
+        }
+      } catch (error) {
+        console.error("Whisper APIエラー:", error);
+      }
+    }
+
+    document.getElementById('start').addEventListener('click', startRecording);
+    document.getElementById('stop').addEventListener('click', stopRecording);
+    window.addEventListener('load', initSettings);
+  </script>
+</body>
+</html>
